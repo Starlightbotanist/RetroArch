@@ -3428,6 +3428,10 @@ bool runloop_environment_cb(unsigned cmd, void *data)
       }
 
       case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+#ifdef HAVE_RUNAHEAD
+         if (runloop_st->checkpoint_speculative)
+            return false;
+#endif
       /**
        * Update the system Audio/Video information.
        * Will reinitialize audio/video drivers if needed.
@@ -3819,6 +3823,27 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
       }
 
+#ifdef HAVE_RUNAHEAD
+      case RETRO_ENVIRONMENT_GET_CHECKPOINT_SPECULATIVE:
+         if (!data)
+            return false;
+         *(bool *)data = runloop_st->checkpoint_speculative;
+         return true;
+      case RETRO_ENVIRONMENT_SET_CHECKPOINT_INTERFACE:
+      {
+         const struct retro_checkpoint_interface *iface =
+               (const struct retro_checkpoint_interface *)data;
+         if (!iface || iface->version != RETRO_CHECKPOINT_INTERFACE_VERSION ||
+             iface->size < sizeof(*iface) || !iface->supported || !iface->create ||
+             !iface->save || !iface->load || !iface->release || !iface->valid ||
+             runloop_st->checkpoint_iface.version ||
+             (runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED))
+            return false;
+         runloop_st->checkpoint_iface = *iface;
+         RARCH_LOG("[Run-Ahead] Same-instance checkpoint interface accepted.\n");
+         return true;
+      }
+#endif
       case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS:
       case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS_2:
       {
@@ -5433,6 +5458,10 @@ static retro_time_t runloop_core_runtime_tick(
 static bool core_unload_game(void)
 {
    runloop_state_t *runloop_st    = &runloop_state;
+
+#ifdef HAVE_RUNAHEAD
+   runahead_checkpoint_uninit(runloop_st);
+#endif
 
    video_driver_free_hw_context();
 
@@ -9941,7 +9970,11 @@ int runloop_iterate(void)
 #ifdef HAVE_CHEEVOS
          if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
          {
-            if (runloop_is_libretro_running(runloop_st, menu_pause_libretro))
+            if (runloop_is_libretro_running(runloop_st, menu_pause_libretro)
+#ifdef HAVE_RUNAHEAD
+                  && !runloop_st->runahead_restore_pending
+#endif
+               )
             {
                if (!runloop_st->menu_core_skipped)
                   rcheevos_test();
@@ -10069,6 +10102,7 @@ int runloop_iterate(void)
 #ifdef HAVE_NETWORKING
       want_runahead                     = want_runahead && !netplay_is_enabled;
 #endif
+      want_runahead                     = want_runahead || runloop_st->runahead_restore_pending;
 
       if (want_runahead)
          frame_advanced = runahead_run(
@@ -10080,8 +10114,25 @@ int runloop_iterate(void)
          frame_advanced = preempt_run(runloop_st->preempt_data, runloop_st);
       else
 #endif
+      {
+#ifdef HAVE_RUNAHEAD
+         if (runloop_st->runahead_checkpoint)
+            runahead_checkpoint_release(runloop_st);
+#endif
          frame_advanced = core_run();
+      }
    }
+
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->runahead_restore_pending && !frame_advanced)
+   {
+#ifdef HAVE_THREADS
+      if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
+         autosave_unlock();
+#endif
+      goto end;
+   }
+#endif
 
    runloop_load_deferred_auto_state();
 
@@ -10107,6 +10158,10 @@ int runloop_iterate(void)
    runloop_st->core_runtime_usec += runloop_core_runtime_tick(
          runloop_st, slowmotion_ratio, current_time);
 
+#ifdef HAVE_RUNAHEAD
+   if (!runloop_st->runahead_restore_pending)
+   {
+#endif
 #ifdef HAVE_CHEEVOS
    if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
       rcheevos_test();
@@ -10114,6 +10169,9 @@ int runloop_iterate(void)
 #ifdef HAVE_CHEATS
    if (runloop_st->frame_work & RUNLOOP_WORK_CHEATS)
       cheat_manager_apply_retro_cheats();
+#endif
+#ifdef HAVE_RUNAHEAD
+   }
 #endif
 
    /* The core's rumble and LED calls stored what it asked for; write
@@ -10825,6 +10883,14 @@ bool core_get_memory(retro_ctx_memory_info_t *info)
    runloop_state_t *runloop_st    = &runloop_state;
    if (!info)
       return false;
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->runahead_restore_pending)
+   {
+      info->size = 0;
+      info->data = NULL;
+      return true;
+   }
+#endif
    info->size  = runloop_st->current_core.retro_get_memory_size(info->id);
    info->data  = runloop_st->current_core.retro_get_memory_data(info->id);
    return true;
@@ -10908,6 +10974,14 @@ bool core_unserialize(retro_ctx_serialize_info_t *info)
    if (!ok)
       return false;
 
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->runahead_restore_pending)
+   {
+      runloop_st->runahead_restore_pending = false;
+      runahead_checkpoint_release(runloop_st);
+   }
+#endif
+
 #ifdef HAVE_NETWORKING
    netplay_driver_ctl(RARCH_NETPLAY_CTL_LOAD_SAVESTATE, info);
 #endif
@@ -10941,6 +11015,10 @@ bool core_unserialize_special(retro_ctx_serialize_info_t *info)
 bool core_serialize(retro_ctx_serialize_info_t *info)
 {
    runloop_state_t *runloop_st  = &runloop_state;
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->runahead_restore_pending)
+      return false;
+#endif
    if (!info || !runloop_st->current_core.retro_serialize(info->data, info->size))
       return false;
    return true;
@@ -11002,6 +11080,10 @@ void core_reset(void)
    runloop_st->current_core.retro_reset();
 #ifdef HAVE_THREADS
    video_thread_core_context_release();
+#endif
+#ifdef HAVE_RUNAHEAD
+   runloop_st->runahead_restore_pending = false;
+   runahead_checkpoint_release(runloop_st);
 #endif
 }
 

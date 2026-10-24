@@ -44,6 +44,7 @@
 #include "state_manager.h"
 #ifdef HAVE_RUNAHEAD
 #include "runahead.h"
+#include <retro_checkpoint.h>
 #endif
 #include "tasks/tasks_internal.h"
 
@@ -257,14 +258,12 @@ struct runloop
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
    char    *secondary_library_path;
 #endif
-   /* Embedded directly: was previously a my_list wrapper holding a
-    * single retro_ctx_serialize_info_t* in data[0].  The list machinery
-    * was overkill for one pointer — two extra mallocs at init (the
-    * my_list struct + its 16-slot data array), one extra indirection
-    * per access, and a constructor/destructor function-pointer pair
-    * for what amounts to alloc/free of a data buffer. */
    retro_ctx_serialize_info_t runahead_savestate_info;
    preempt_t *preempt_data;
+   struct retro_checkpoint_interface checkpoint_iface;
+   void *runahead_checkpoint;
+   bool checkpoint_speculative;
+   bool runahead_restore_pending;
 #endif
 
 #ifdef HAVE_REWIND

@@ -30,6 +30,8 @@ typedef struct preemptive_frames_data
 {
    /* Savestate buffer */
    void* buffer[MAX_RUNAHEAD_FRAMES];
+   void* checkpoint[MAX_RUNAHEAD_FRAMES];
+   bool use_checkpoints;
    size_t state_size;
 
    /* Frame count since buffer init/reset */
@@ -66,6 +68,8 @@ bool runahead_run(
       bool use_secondary);
 
 void runahead_clear_variables(void *data);
+void runahead_checkpoint_uninit(void *data);
+void runahead_checkpoint_release(void *data);
 
 void runahead_remember_controller_port_device(void *data,
       long port, long device);

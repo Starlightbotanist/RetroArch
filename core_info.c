@@ -40,6 +40,10 @@
 #include "core_info.h"
 #include "file_path_special.h"
 
+#ifdef HAVE_RUNAHEAD
+#include "runloop.h"
+#endif
+
 #if defined(__WINRT__) || defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP
 #include "uwp/uwp_func.h"
 #endif
@@ -3079,6 +3083,10 @@ bool core_info_current_supports_netplay(void)
 
 bool core_info_current_supports_runahead(void)
 {
+#ifdef HAVE_RUNAHEAD
+   if (runloop_state_get_ptr()->checkpoint_iface.version)
+      return true;
+#endif
    return core_info_current_supports_savestate_level(
          CORE_INFO_SAVESTATE_DETERMINISTIC);
 }

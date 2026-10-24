@@ -50,6 +50,9 @@
 #include "driver.h"
 #include "audio/audio_driver.h"
 #include "gfx/video_driver.h"
+#ifdef HAVE_THREADS
+#include "gfx/video_thread_wrapper.h"
+#endif
 #include "paths.h"
 #include "runloop.h"
 #include "verbosity.h"
@@ -1363,6 +1366,100 @@ static void runahead_remove_input_state_hook(runloop_state_t *runloop_st)
    }
 }
 
+static void *runahead_checkpoint_create(runloop_state_t *runloop_st)
+{
+   void *checkpoint;
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   checkpoint = runloop_st->checkpoint_iface.create();
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+   return checkpoint;
+}
+
+static void runahead_checkpoint_release_handle(runloop_state_t *runloop_st,
+      void *checkpoint)
+{
+   if (!checkpoint)
+      return;
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   runloop_st->checkpoint_iface.release(checkpoint);
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+}
+
+static bool runahead_checkpoint_save(runloop_state_t *runloop_st,
+      void *checkpoint)
+{
+   bool okay;
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   okay = runloop_st->checkpoint_iface.save(checkpoint);
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+   return okay;
+}
+
+static bool runahead_checkpoint_restore(runloop_state_t *runloop_st,
+      void **checkpoint)
+{
+   void *replacement;
+   bool okay;
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   replacement = runloop_st->checkpoint_iface.create();
+   okay = runloop_st->checkpoint_iface.valid(*checkpoint) &&
+         runloop_st->checkpoint_iface.load(*checkpoint);
+   if (okay && replacement)
+   {
+      runloop_st->checkpoint_iface.release(*checkpoint);
+      *checkpoint = replacement;
+   }
+   else if (replacement)
+      runloop_st->checkpoint_iface.release(replacement);
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+   return okay;
+}
+
+void runahead_checkpoint_release(void *data)
+{
+   runloop_state_t *runloop_st = (runloop_state_t*)data;
+   if (runloop_st->runahead_restore_pending)
+      return;
+   runloop_st->checkpoint_speculative = false;
+   if (runloop_st->runahead_checkpoint)
+      runahead_checkpoint_release_handle(runloop_st, runloop_st->runahead_checkpoint);
+   runloop_st->runahead_checkpoint = NULL;
+}
+
+void runahead_checkpoint_uninit(void *data)
+{
+   runloop_state_t *runloop_st = (runloop_state_t *)data;
+   preempt_t *preempt = runloop_st->preempt_data;
+   unsigned i;
+   runloop_st->checkpoint_speculative = false;
+   runloop_st->runahead_restore_pending = false;
+   runahead_checkpoint_release(runloop_st);
+   if (preempt)
+      for (i = 0; i < preempt->frames; i++)
+      {
+         if (preempt->checkpoint[i])
+            runahead_checkpoint_release_handle(runloop_st, preempt->checkpoint[i]);
+         preempt->checkpoint[i] = NULL;
+      }
+   memset(&runloop_st->checkpoint_iface, 0, sizeof(runloop_st->checkpoint_iface));
+}
+
 static bool runahead_savestate_info_init(
       runloop_state_t *runloop_st,
       size_t save_state_size)
@@ -1380,6 +1477,9 @@ static bool runahead_savestate_info_init(
    info->data_const = NULL;
    info->size       = 0;
 
+   if (runloop_st->checkpoint_iface.version)
+      return true;
+
    if (save_state_size == 0)
       return false;
 
@@ -1395,6 +1495,7 @@ static bool runahead_savestate_info_init(
 static void runahead_savestate_info_free(runloop_state_t *runloop_st)
 {
    retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
+   runahead_checkpoint_release(runloop_st);
    free(info->data);
    info->data       = NULL;
    info->data_const = NULL;
@@ -1471,6 +1572,7 @@ static void runahead_add_hooks(runloop_state_t *runloop_st)
 
 static void runahead_err(runloop_state_t *runloop_st)
 {
+   runloop_st->checkpoint_speculative = false;
    runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_AVAILABLE;
    runahead_savestate_info_free(runloop_st);
    runahead_remove_hooks(runloop_st);
@@ -1481,7 +1583,8 @@ static bool runahead_create(runloop_state_t *runloop_st)
 {
    /* get savestate size and allocate buffer */
    video_driver_state_t *video_st = video_state_get_ptr();
-   size_t info_size               = core_serialize_size_special();
+   size_t info_size               = runloop_st->checkpoint_iface.version
+         ? 0 : core_serialize_size_special();
 
    if (!runahead_savestate_info_init(runloop_st, info_size))
    {
@@ -1499,11 +1602,31 @@ static bool runahead_create(runloop_state_t *runloop_st)
    return true;
 }
 
-static bool runahead_save_state(runloop_state_t *runloop_st)
+static bool runahead_save_state(runloop_state_t *runloop_st, bool same_instance)
 {
    retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
-   if (info->data)
+   if (same_instance && runloop_st->checkpoint_iface.version)
    {
+      bool okay;
+      if (!runloop_st->checkpoint_iface.supported())
+      {
+         RARCH_WARN("[Run-Ahead] Core checkpoint configuration is unavailable.\n");
+         runahead_err(runloop_st);
+         return false;
+      }
+      if (!runloop_st->runahead_checkpoint)
+         runloop_st->runahead_checkpoint = runahead_checkpoint_create(runloop_st);
+      runloop_st->flags |= RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
+      okay = runloop_st->runahead_checkpoint &&
+            runahead_checkpoint_save(runloop_st, runloop_st->runahead_checkpoint);
+      runloop_st->flags &= ~RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
+      if (okay)
+         return true;
+      runahead_err(runloop_st);
+   }
+   else if (info->data)
+   {
+      runahead_checkpoint_release(runloop_st);
       if (core_serialize_special(info))
          return true;
       runahead_err(runloop_st);
@@ -1515,14 +1638,33 @@ static bool runahead_load_state(runloop_state_t *runloop_st)
 {
    retro_ctx_serialize_info_t *info = &runloop_st->runahead_savestate_info;
    bool last_dirty                  = (runloop_st->flags & RUNLOOP_FLAG_INPUT_IS_DIRTY) ? true : false;
-   bool ret                         = core_unserialize_special(info);
+   bool ret;
+   if (runloop_st->runahead_checkpoint)
+   {
+      runloop_st->flags |= RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
+      ret = runahead_checkpoint_restore(runloop_st, &runloop_st->runahead_checkpoint);
+      runloop_st->flags &= ~RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
+   }
+   else
+      ret = core_unserialize_special(info);
    if (last_dirty)
       runloop_st->flags             |=  RUNLOOP_FLAG_INPUT_IS_DIRTY;
    else
       runloop_st->flags             &= ~RUNLOOP_FLAG_INPUT_IS_DIRTY;
 
    if (!ret)
-      runahead_err(runloop_st);
+   {
+      if (runloop_st->runahead_checkpoint)
+      {
+         /* Retain the checkpoint for retry. */
+         runloop_st->checkpoint_speculative = false;
+         runloop_st->runahead_restore_pending = true;
+         runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_AVAILABLE;
+         command_event(CMD_EVENT_PAUSE, NULL);
+      }
+      else
+         runahead_err(runloop_st);
+   }
 
    return ret;
 }
@@ -1544,6 +1686,19 @@ static bool runahead_load_state_secondary(runloop_state_t *runloop_st, settings_
 }
 #endif
 
+static void runahead_core_run(runloop_state_t *runloop_st)
+{
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   runloop_st->current_core.retro_run();
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+   if (runloop_st->auto_state_load_pending)
+      runloop_st->auto_state_load_core_ran = true;
+}
+
 static void runahead_core_run_use_last_input(runloop_state_t *runloop_st)
 {
    struct retro_callbacks *cbs            = &runloop_st->retro_ctx;
@@ -1556,9 +1711,7 @@ static void runahead_core_run_use_last_input(runloop_state_t *runloop_st)
    runloop_st->current_core.retro_set_input_poll(cbs->poll_cb);
    runloop_st->current_core.retro_set_input_state(cbs->state_cb);
 
-   runloop_st->current_core.retro_run();
-   if (runloop_st->auto_state_load_pending)
-      runloop_st->auto_state_load_core_ran = true;
+   runahead_core_run(runloop_st);
    audio_driver_frame_end();
 
    cbs->poll_cb                           = old_poll_function;
@@ -1604,6 +1757,24 @@ bool runahead_run(void *data,
    uint64_t frame_count    = video_st->frame_count;
    audio_driver_state_t
       *audio_st            = audio_state_get_ptr();
+
+   if (runloop_st->runahead_restore_pending)
+   {
+      if (!runahead_load_state(runloop_st))
+         return false;
+      runloop_st->runahead_restore_pending = false;
+      runahead_err(runloop_st);
+      goto force_input_dirty;
+   }
+
+   /* Checkpoints cannot cross core instances. */
+   if (use_secondary && runloop_st->checkpoint_iface.version)
+   {
+      if (runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE)
+         RARCH_LOG("[Run-Ahead] Using same-instance checkpoints for this core.\n");
+      runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE;
+      use_secondary = false;
+   }
 
    if (      runahead_count <= 0
          || !(runloop_st->flags & RUNLOOP_FLAG_RUNAHEAD_AVAILABLE))
@@ -1697,7 +1868,10 @@ bool runahead_run(void *data,
          if (frame_number == 0)
             advanced = core_run();
          else
+         {
+            runloop_st->checkpoint_speculative = runloop_st->runahead_checkpoint != NULL;
             runahead_core_run_use_last_input(runloop_st);
+         }
 
          if (suspended_frame)
          {
@@ -1714,7 +1888,7 @@ bool runahead_run(void *data,
 
          if (frame_number == 0)
          {
-            if (!runahead_save_state(runloop_st))
+            if (!runahead_save_state(runloop_st, true))
             {
                const char *_msg =
                   msg_hash_to_str(MSG_RUNAHEAD_FAILED_TO_SAVE_STATE);
@@ -1727,7 +1901,9 @@ bool runahead_run(void *data,
 
          if (last_frame)
          {
-            if (!runahead_load_state(runloop_st))
+            bool restored = runahead_load_state(runloop_st);
+            runloop_st->checkpoint_speculative = false;
+            if (!restored)
             {
                const char *_msg = msg_hash_to_str(MSG_RUNAHEAD_FAILED_TO_LOAD_STATE);
                runloop_msg_queue_push(_msg, strlen(_msg), 0, 3 * 60, true, NULL,
@@ -1759,7 +1935,7 @@ bool runahead_run(void *data,
       {
          runloop_st->flags &= ~RUNLOOP_FLAG_INPUT_IS_DIRTY;
 
-         if (!runahead_save_state(runloop_st))
+         if (!runahead_save_state(runloop_st, false))
          {
             const char *_msg = msg_hash_to_str(MSG_RUNAHEAD_FAILED_TO_SAVE_STATE);
             runloop_msg_queue_push(_msg, strlen(_msg), 0, 3 * 60, true, NULL,
@@ -1804,6 +1980,7 @@ bool runahead_run(void *data,
    return advanced;
 
 force_input_dirty:
+   runahead_checkpoint_release(runloop_st);
    advanced = core_run();
    runloop_st->flags |=  RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY;
    return advanced;
@@ -1899,19 +2076,34 @@ static const char* preempt_allocate(runloop_state_t *runloop_st,
       const uint8_t frames)
 {
    size_t info_size;
+   unsigned i;
    preempt_t *preempt = (preempt_t*)calloc(1, sizeof(preempt_t));
 
    if (!(runloop_st->preempt_data = preempt))
       return msg_hash_to_str(MSG_PREEMPT_FAILED_TO_ALLOCATE);
 
-   info_size = core_serialize_size_special();
-   if (!info_size)
+   info_size = runloop_st->checkpoint_iface.version
+         ? 0 : core_serialize_size_special();
+   if (!runloop_st->checkpoint_iface.version && !info_size)
       return msg_hash_to_str(MSG_PREEMPT_CORE_DOES_NOT_SUPPORT_SAVESTATES);
 
    preempt->state_size = info_size;
    preempt->frames     = frames;
 
-   if (!preempt_slab_alloc(preempt->buffer, frames, info_size))
+   runahead_checkpoint_release(runloop_st);
+   preempt->use_checkpoints = runloop_st->checkpoint_iface.version != 0;
+   if (preempt->use_checkpoints)
+   {
+      if (!runloop_st->checkpoint_iface.supported())
+         return msg_hash_to_str(MSG_PREEMPT_CORE_DOES_NOT_SUPPORT_PREEMPT);
+      for (i = 0; i < frames; i++)
+      {
+         preempt->checkpoint[i] = runahead_checkpoint_create(runloop_st);
+         if (!preempt->checkpoint[i])
+            return msg_hash_to_str(MSG_PREEMPT_FAILED_TO_ALLOCATE);
+      }
+   }
+   else if (!preempt_slab_alloc(preempt->buffer, frames, info_size))
       return msg_hash_to_str(MSG_PREEMPT_FAILED_TO_ALLOCATE);
 
    return NULL;
@@ -1924,12 +2116,16 @@ static const char* preempt_allocate(runloop_state_t *runloop_st,
  **/
 void preempt_deinit(void *data)
 {
+   unsigned i;
    runloop_state_t *runloop_st       = (runloop_state_t*)data;
    preempt_t *preempt                = runloop_st->preempt_data;
    struct retro_core_t *current_core = &runloop_st->current_core;
 
    if (!preempt)
       return;
+
+   for (i = 0; i < preempt->frames; i++)
+      runahead_checkpoint_release_handle(runloop_st, preempt->checkpoint[i]);
 
    /* One slab; buffer[0] is its base. */
    free(preempt->buffer[0]);
@@ -1964,8 +2160,10 @@ bool preempt_init(void *data)
    bool run_ahead_hide_warnings  = settings->bools.run_ahead_hide_warnings;
 
    if (     runloop_st->preempt_data
+         || runloop_st->runahead_restore_pending
          || !preemptive_frames_enable
          || !run_ahead_frames
+         || run_ahead_frames > MAX_RUNAHEAD_FRAMES
          || !(runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED))
       return false;
 
@@ -1984,9 +2182,7 @@ bool preempt_init(void *data)
     * retro_serialize_size or retro_serialize */
    if (video_state_get_ptr()->frame_count == 0)
    {
-      runloop_st->current_core.retro_run();
-      if (runloop_st->auto_state_load_pending)
-         runloop_st->auto_state_load_core_ran = true;
+      runahead_core_run(runloop_st);
       audio_driver_frame_end();
    }
 
@@ -2134,6 +2330,24 @@ static INLINE void preempt_input_poll(preempt_t *preempt,
 /* macro for preempt_run */
 #define PREEMPT_NEXT_PTR(x) ((x + 1) % preempt->frames)
 
+static bool preempt_load_checkpoint(preempt_t *preempt,
+      runloop_state_t *runloop_st, unsigned index)
+{
+   if (preempt->use_checkpoints)
+      return runahead_checkpoint_restore(runloop_st, &preempt->checkpoint[index]);
+   return runloop_st->current_core.retro_unserialize(
+         preempt->buffer[index], preempt->state_size);
+}
+
+static bool preempt_save_checkpoint(preempt_t *preempt,
+      runloop_state_t *runloop_st, unsigned index)
+{
+   if (preempt->use_checkpoints)
+      return runahead_checkpoint_save(runloop_st, preempt->checkpoint[index]);
+   return runloop_st->current_core.retro_serialize(
+         preempt->buffer[index], preempt->state_size);
+}
+
 /**
  * preempt_run:
  * @preempt : pointer to preemptive frames object
@@ -2143,15 +2357,25 @@ static INLINE void preempt_input_poll(preempt_t *preempt,
 bool preempt_run(preempt_t *preempt, void *data)
 {
    runloop_state_t     *runloop_st   = (runloop_state_t*)data;
-   struct retro_core_t *current_core = &runloop_st->current_core;
    const char *_msg                  = NULL;
    audio_driver_state_t *audio_st    = audio_state_get_ptr();
    settings_t *settings              = config_get_ptr();
    unsigned input_max_users          = settings->uints.input_max_users;
    bool run_ahead_hide_warnings      = settings->bools.run_ahead_hide_warnings;
+   bool replay_save_failed          = false;
+
+   if (preempt->use_checkpoints && preempt->frame_count >= preempt->frames &&
+       !runloop_st->checkpoint_iface.valid(preempt->checkpoint[preempt->start_ptr]))
+      preempt->frame_count = 0;
 
    /* Poll and check for dirty input */
    preempt_input_poll(preempt, runloop_st, input_max_users);
+
+   if (preempt->use_checkpoints && !runloop_st->checkpoint_iface.supported())
+   {
+      _msg = msg_hash_to_str(MSG_PREEMPT_CORE_DOES_NOT_SUPPORT_PREEMPT);
+      goto error;
+   }
 
    runloop_st->flags                |= RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
 
@@ -2162,30 +2386,27 @@ bool preempt_run(preempt_t *preempt, void *data)
       AUDIO_FLAGS_SET(audio_st, AUDIO_FLAG_SUSPENDED);
       video_state_get_ptr()->main_flags &= ~VIDEO_FLAG_ACTIVE;
 
-      if (!current_core->retro_unserialize(
-            preempt->buffer[preempt->start_ptr], preempt->state_size))
+      if (!preempt_load_checkpoint(preempt, runloop_st, preempt->start_ptr))
       {
          _msg = msg_hash_to_str(MSG_PREEMPT_FAILED_TO_LOAD_STATE);
          goto error;
       }
 
-      current_core->retro_run();
-      if (runloop_st->auto_state_load_pending)
-         runloop_st->auto_state_load_core_ran = true;
+      runloop_st->checkpoint_speculative = preempt->use_checkpoints;
+      runahead_core_run(runloop_st);
       preempt->replay_ptr = PREEMPT_NEXT_PTR(preempt->start_ptr);
 
       while (preempt->replay_ptr != preempt->start_ptr)
       {
-         if (!current_core->retro_serialize(
-               preempt->buffer[preempt->replay_ptr], preempt->state_size))
+         if (!replay_save_failed &&
+             !preempt_save_checkpoint(preempt, runloop_st, preempt->replay_ptr))
          {
             _msg = msg_hash_to_str(MSG_PREEMPT_FAILED_TO_SAVE_STATE);
-            goto error;
+            /* Finish replay before disabling prediction. */
+            replay_save_failed = true;
          }
 
-         current_core->retro_run();
-         if (runloop_st->auto_state_load_pending)
-            runloop_st->auto_state_load_core_ran = true;
+         runahead_core_run(runloop_st);
          preempt->replay_ptr = PREEMPT_NEXT_PTR(preempt->replay_ptr);
       }
 
@@ -2193,9 +2414,12 @@ bool preempt_run(preempt_t *preempt, void *data)
       video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
    }
 
+   runloop_st->checkpoint_speculative = false;
+   if (replay_save_failed)
+      goto error;
+
    /* Save current state and set start_ptr to oldest state */
-   if (!current_core->retro_serialize(
-         preempt->buffer[preempt->start_ptr], preempt->state_size))
+   if (!preempt_save_checkpoint(preempt, runloop_st, preempt->start_ptr))
    {
       _msg = msg_hash_to_str(MSG_PREEMPT_FAILED_TO_SAVE_STATE);
       goto error;
@@ -2206,25 +2430,26 @@ bool preempt_run(preempt_t *preempt, void *data)
          | RUNLOOP_FLAG_INPUT_IS_DIRTY);
 
    /* Run normal frame */
-   current_core->retro_run();
-   if (runloop_st->auto_state_load_pending)
-      runloop_st->auto_state_load_core_ran = true;
+   runahead_core_run(runloop_st);
    audio_driver_frame_end();
    preempt->frame_count++;
    return true;
 
 error:
+   runloop_st->checkpoint_speculative = false;
    runloop_st->flags &= ~(RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE
          | RUNLOOP_FLAG_INPUT_IS_DIRTY);
    AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_SUSPENDED);
    video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
+   runahead_core_run(runloop_st);
+   audio_driver_frame_end();
    preempt_deinit(runloop_st);
 
    if (!run_ahead_hide_warnings)
       runloop_msg_queue_push(_msg, strlen(_msg), 0, 2 * 60, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    RARCH_ERR("[Run-Ahead Preemptive] %s\n", _msg);
-   return false;
+   return true;
 }
 
 void runahead_clear_variables(void *data)

@@ -360,6 +360,10 @@ void autosave_check(void)
 {
    unsigned i;
 
+#ifdef HAVE_RUNAHEAD
+   if (runloop_state_get_ptr()->runahead_restore_pending)
+      return;
+#endif
    if (autosave_state.depth)
       return;
 
