@@ -2045,6 +2045,13 @@ static void runloop_video_decode_close(void *decoder)
 }
 #endif
 
+#ifdef HAVE_RUNAHEAD
+static enum retro_snapshot_execution_context RETRO_CALLCONV runloop_snapshot_context(void)
+{
+   return runloop_state_get_ptr()->snapshot_context;
+}
+#endif
+
 bool runloop_environment_cb(unsigned cmd, void *data)
 {
    unsigned p;
@@ -3443,6 +3450,10 @@ bool runloop_environment_cb(unsigned cmd, void *data)
       }
 
       case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+#ifdef HAVE_RUNAHEAD
+         if (runloop_st->snapshot_context == RETRO_SNAPSHOT_SPECULATIVE)
+            return false;
+#endif
       /**
        * Update the system Audio/Video information.
        * Will reinitialize audio/video drivers if needed.
@@ -3846,6 +3857,27 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
       }
 
+#ifdef HAVE_RUNAHEAD
+      case RETRO_ENVIRONMENT_SET_SNAPSHOT_INTERFACE:
+      {
+         struct retro_snapshot_interface *iface =
+               (struct retro_snapshot_interface *)data;
+         if (!iface || runloop_st->snapshot_iface.version ||
+             (runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED))
+            return false;
+         runloop_st->snapshot_iface_declined = true;
+         if (iface->version != RETRO_SNAPSHOT_INTERFACE_VERSION ||
+             iface->size < sizeof(*iface) || !iface->supported || !iface->create ||
+             !iface->save || !iface->load || !iface->release || !iface->valid)
+            return false;
+         iface->get_execution_context = runloop_snapshot_context;
+         runloop_st->snapshot_iface = *iface;
+         runloop_st->snapshot_iface.size = sizeof(*iface);
+         runloop_st->snapshot_iface_declined = false;
+         RARCH_LOG("[Run-Ahead] Same-instance snapshot interface accepted.\n");
+         return true;
+      }
+#endif
       case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS:
       case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS_2:
       {
@@ -5461,6 +5493,10 @@ static retro_time_t runloop_core_runtime_tick(
 static bool core_unload_game(void)
 {
    runloop_state_t *runloop_st    = &runloop_state;
+
+#ifdef HAVE_RUNAHEAD
+   runahead_snapshot_uninit(runloop_st);
+#endif
 
    video_driver_free_hw_context();
 #ifdef HAVE_TEMPORAL_UPSCALER
@@ -8149,42 +8185,45 @@ static enum runloop_state_enum runloop_check_state(
          command_event(CMD_EVENT_CLOSE_CONTENT, NULL);
    }
 
-   /* Check quit hotkey */
-   if (!(input_st->flags & INP_FLAG_WAIT_INPUT_RELEASE))
+   /* ===== BEGIN runloop quit check ===== */
    {
       static bool quit_key       = false;
       static bool old_quit_key   = false;
       static bool runloop_exec   = false;
-      bool trig_quit_key;
+      bool trig_quit_key         = false;
 
-      quit_key                 = BIT256_GET(current_bits, RARCH_QUIT_KEY);
-      trig_quit_key            = quit_key && !old_quit_key;
-
-      /* The quit controller combination presses the quit hotkey, when
-       * it is set and held (input_combos_frame()): like the key, it
-       * counts on the frame it is first down, or one press would also
-       * be the second press that 'confirm_quit' asks for. */
-      old_quit_key             = quit_key;
-
-      /* Check double press if enabled */
-      if (     trig_quit_key
-            && settings->bools.confirm_quit)
+      /* Input debounce must not delay core shutdown or other exit reasons. */
+      if (!(input_st->flags & INP_FLAG_WAIT_INPUT_RELEASE))
       {
-         static retro_time_t quit_key_time   = 0;
-         retro_time_t cur_time               = current_time;
-         trig_quit_key                       = (cur_time - quit_key_time < QUIT_DELAY_USEC);
-         quit_key_time                       = cur_time;
+         quit_key                 = BIT256_GET(current_bits, RARCH_QUIT_KEY);
+         trig_quit_key            = quit_key && !old_quit_key;
 
-         if (!trig_quit_key)
+         /* The quit controller combination presses the quit hotkey, when
+          * it is set and held (input_combos_frame()): like the key, it
+          * counts on the frame it is first down, or one press would also
+          * be the second press that 'confirm_quit' asks for. */
+         old_quit_key             = quit_key;
+
+         /* Check double press if enabled */
+         if (     trig_quit_key
+               && settings->bools.confirm_quit)
          {
-            const char *_msg = msg_hash_to_str(MSG_PRESS_AGAIN_TO_QUIT);
-            float target_hz  = 0.0;
+            static retro_time_t quit_key_time   = 0;
+            retro_time_t cur_time               = current_time;
+            trig_quit_key                       = (cur_time - quit_key_time < QUIT_DELAY_USEC);
+            quit_key_time                       = cur_time;
 
-            runloop_environment_cb(
-                  RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &target_hz);
+            if (!trig_quit_key)
+            {
+               const char *_msg = msg_hash_to_str(MSG_PRESS_AGAIN_TO_QUIT);
+               float target_hz  = 0.0;
 
-            runloop_msg_queue_push(_msg, strlen(_msg), 1, QUIT_DELAY_USEC * target_hz / 1000000,
-                  true, NULL, MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+               runloop_environment_cb(
+                     RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &target_hz);
+
+               runloop_msg_queue_push(_msg, strlen(_msg), 1, QUIT_DELAY_USEC * target_hz / 1000000,
+                     true, NULL, MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+            }
          }
       }
 
@@ -8265,6 +8304,8 @@ static enum runloop_state_enum runloop_check_state(
          }
       }
    }
+
+   /* ===== END runloop quit check ===== */
 
 #ifdef HAVE_MENU
    /* Check menu hotkey */
@@ -9663,6 +9704,17 @@ static void runloop_gpu_device_lost(runloop_state_t *runloop_st)
    int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
       | DRIVER_MENU_MASK;
 
+#ifdef HAVE_RUNAHEAD
+   /* Recreating a hardware context cannot recover a speculative CPU state
+    * or snapshot textures from the lost device. Keep all consumers stopped
+    * until a healthy content load or explicit reset establishes a new state. */
+   if (video_driver_get_hw_context()->context_type != RETRO_HW_CONTEXT_NONE)
+   {
+      runloop_st->prediction_recovery = PREDICTION_RECOVERY_FATAL;
+      command_event(CMD_EVENT_PAUSE, NULL);
+   }
+#endif
+
    /* Not yet due: leave the flag set and try again on a later frame */
    if (now < runloop_st->gpu_lost_retry_at)
       return;
@@ -9985,7 +10037,11 @@ int runloop_iterate(void)
 #ifdef HAVE_CHEEVOS
          if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
          {
-            if (runloop_is_libretro_running(runloop_st, menu_pause_libretro))
+            if (runloop_is_libretro_running(runloop_st, menu_pause_libretro)
+#ifdef HAVE_RUNAHEAD
+                  && !runloop_st->prediction_recovery
+#endif
+               )
             {
                if (!runloop_st->menu_core_skipped)
                   rcheevos_test();
@@ -10113,8 +10169,13 @@ int runloop_iterate(void)
 #ifdef HAVE_NETWORKING
       want_runahead                     = want_runahead && !netplay_is_enabled;
 #endif
+      want_runahead                     = want_runahead || runloop_st->prediction_recovery;
 
-      if (want_runahead)
+      if (runloop_st->prediction_recovery == PREDICTION_RECOVERY_FATAL)
+         frame_advanced = false;
+      else if (runloop_st->preempt_data && runloop_st->prediction_recovery == PREDICTION_RECOVERY_PREEMPT)
+         frame_advanced = preempt_run(runloop_st->preempt_data, runloop_st);
+      else if (want_runahead)
          frame_advanced = runahead_run(
                runloop_st,
                run_ahead_num_frames,
@@ -10124,8 +10185,25 @@ int runloop_iterate(void)
          frame_advanced = preempt_run(runloop_st->preempt_data, runloop_st);
       else
 #endif
+      {
+#ifdef HAVE_RUNAHEAD
+         if (runloop_st->runahead_storage.slots)
+            runahead_snapshot_release(runloop_st);
+#endif
          frame_advanced = core_run();
+      }
    }
+
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->prediction_recovery && !frame_advanced)
+   {
+#ifdef HAVE_THREADS
+      if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
+         autosave_unlock();
+#endif
+      goto end;
+   }
+#endif
 
    runloop_load_deferred_auto_state();
 
@@ -10151,6 +10229,10 @@ int runloop_iterate(void)
    runloop_st->core_runtime_usec += runloop_core_runtime_tick(
          runloop_st, slowmotion_ratio, current_time);
 
+#ifdef HAVE_RUNAHEAD
+   if (!runloop_st->prediction_recovery)
+   {
+#endif
 #ifdef HAVE_CHEEVOS
    if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
       rcheevos_test();
@@ -10166,6 +10248,9 @@ int runloop_iterate(void)
     * nothing was set. */
    input_driver_flush_rumble();
    led_driver_flush();
+#ifdef HAVE_RUNAHEAD
+   }
+#endif
    /* a first press seen by this frame's poll: the user gets its core
     * port now, with the core off the stack */
    if (input_st->first_press_pending)
@@ -10771,6 +10856,8 @@ bool core_set_cheat(retro_ctx_cheat_info_t *info)
    }
 #endif
 
+   if (!core_state_is_available())
+      return false;
    runloop_st->current_core.retro_cheat_set(info->index, info->enabled, info->code);
 
 #if defined(HAVE_RUNAHEAD) && (defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB))
@@ -10812,6 +10899,8 @@ bool core_reset_cheat(void)
    }
 #endif
 
+   if (!core_state_is_available())
+      return false;
    runloop_st->current_core.retro_cheat_reset();
 
 #if defined(HAVE_RUNAHEAD) && (defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB))
@@ -10864,11 +10953,29 @@ bool core_set_controller_port_device(retro_ctx_controller_info_t *pad)
    return true;
 }
 
+bool core_state_is_available(void)
+{
+#ifdef HAVE_RUNAHEAD
+   if (runloop_state_get_ptr()->prediction_recovery != PREDICTION_RECOVERY_NONE)
+      return false;
+#endif
+   if ((uint32_t)retro_atomic_load_relaxed_int(&video_state_get_ptr()->flags)
+         & VIDEO_FLAG_GPU_DEVICE_LOST)
+      return video_driver_get_hw_context()->context_type == RETRO_HW_CONTEXT_NONE;
+   return true;
+}
+
 bool core_get_memory(retro_ctx_memory_info_t *info)
 {
    runloop_state_t *runloop_st    = &runloop_state;
    if (!info)
       return false;
+   if (!core_state_is_available())
+   {
+      info->size = 0;
+      info->data = NULL;
+      return true;
+   }
    info->size  = runloop_st->current_core.retro_get_memory_size(info->id);
    info->data  = runloop_st->current_core.retro_get_memory_data(info->id);
    return true;
@@ -10950,7 +11057,30 @@ bool core_unserialize(retro_ctx_serialize_info_t *info)
    video_thread_core_context_release();
 #endif
    if (!ok)
+   {
+#ifdef HAVE_RUNAHEAD
+      if (runloop_st->snapshot_iface.version)
+      {
+         if (runloop_st->runahead_storage.slots)
+            runloop_st->prediction_recovery = PREDICTION_RECOVERY_RUNAHEAD;
+         else if (runloop_st->preempt_data &&
+               runloop_st->preempt_data->frame_count >= runloop_st->preempt_data->frames)
+            runloop_st->prediction_recovery = PREDICTION_RECOVERY_PREEMPT;
+         else
+            runloop_st->prediction_recovery = PREDICTION_RECOVERY_FATAL;
+         command_event(CMD_EVENT_PAUSE, NULL);
+      }
+#endif
       return false;
+   }
+
+#ifdef HAVE_RUNAHEAD
+   if (runloop_st->prediction_recovery)
+   {
+      runloop_st->prediction_recovery = PREDICTION_RECOVERY_NONE;
+      runahead_snapshot_release(runloop_st);
+   }
+#endif
 
 #ifdef HAVE_NETWORKING
    netplay_driver_ctl(RARCH_NETPLAY_CTL_LOAD_SAVESTATE, info);
@@ -10985,6 +11115,8 @@ bool core_unserialize_special(retro_ctx_serialize_info_t *info)
 bool core_serialize(retro_ctx_serialize_info_t *info)
 {
    runloop_state_t *runloop_st  = &runloop_state;
+   if (!core_state_is_available())
+      return false;
    if (!info || !runloop_st->current_core.retro_serialize(info->data, info->size))
       return false;
    return true;
@@ -10995,6 +11127,8 @@ bool core_serialize_special(retro_ctx_serialize_info_t *info)
    bool ret;
    runloop_state_t *runloop_st = &runloop_state;
 
+   if (!core_state_is_available())
+      return false;
    if (!info)
       return false;
 
@@ -11009,6 +11143,8 @@ bool core_serialize_special(retro_ctx_serialize_info_t *info)
 size_t core_serialize_size(void)
 {
    runloop_state_t *runloop_st  = &runloop_state;
+   if (!core_state_is_available())
+      return 0;
    return runloop_st->current_core.retro_serialize_size();
 }
 
@@ -11016,6 +11152,8 @@ size_t core_serialize_size_special(void)
 {
    size_t val;
    runloop_state_t *runloop_st = &runloop_state;
+   if (!core_state_is_available())
+      return 0;
    runloop_st->flags |=  RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
    val                = runloop_st->current_core.retro_serialize_size();
    runloop_st->flags &= ~RUNLOOP_FLAG_REQUEST_SPECIAL_SAVESTATE;
@@ -11046,6 +11184,20 @@ void core_reset(void)
    runloop_st->current_core.retro_reset();
 #ifdef HAVE_THREADS
    video_thread_core_context_release();
+#endif
+#ifdef HAVE_RUNAHEAD
+   /* retro_reset() has no result. While recovery is pending,
+    * it cannot confirm that the core or device is usable again. Keep
+    * the barrier and recovery anchor until a successful state load
+    * or content reload. */
+   if (runloop_st->prediction_recovery != PREDICTION_RECOVERY_NONE)
+      return;
+   runloop_st->prediction_recovery = PREDICTION_RECOVERY_NONE;
+   if (runloop_st->preempt_data)
+   {
+      runloop_st->preempt_data->frame_count = 0;
+   }
+   runahead_snapshot_release(runloop_st);
 #endif
 }
 
@@ -11125,6 +11277,8 @@ bool core_run(void)
     * keeps being drawn.  Same shape as the netplay-paused case
     * below, for the same reason: a frame that stops being produced
     * reads as a hang. */
+   if (!core_state_is_available())
+      return false;
    if (runloop_st->content_closing || runloop_st->content_switching)
    {
       input_driver_poll_between_frames(input_driver_poll);
@@ -11175,6 +11329,16 @@ bool core_run(void)
 #ifdef HAVE_THREADS
       video_thread_core_context_release();
 #endif
+      /* Presentation can report loss from inside retro_run, or concurrently
+       * on the video thread. Stop consumers before the next runloop rebuild. */
+      if (!core_state_is_available())
+      {
+#ifdef HAVE_RUNAHEAD
+         runloop_st->prediction_recovery = PREDICTION_RECOVERY_FATAL;
+#endif
+         command_event(CMD_EVENT_PAUSE, NULL);
+         return false;
+      }
       ran = true;
       if (runloop_st->auto_state_load_pending)
          runloop_st->auto_state_load_core_ran = true;
