@@ -1,12 +1,14 @@
 # Runtime snapshot test host
 
-This standalone public-libretro consumer is vendored with libretro-common.
+RetroArch owns this standalone public-libretro test consumer.
 It has no RetroArch headers or core-private dependencies. Cores keep their
-profiles and workload generators in their own test directories. The common
-source files must remain identical across vendored copies.
+profiles and workload generators in their own test directories. Cores fetch a pinned copy for
+testing instead of maintaining their own copies of the host and runners.
 
 Build with `make` and a desktop C compiler. Linux links libdl; native Windows
 uses MinGW and LoadLibrary. No build output belongs in source control.
+Explicit builds recompile the host/proxy; `make check` covers revision switching,
+failed-build retry and source fetching.
 
 `snapshot_smoke CORE NEW_DIRECTORY PROFILE CONTENT [SYSTEM_DIRECTORY]` checks
 retained guest GPU/RSP reads, full RAM, normalized software RGB, repeated loads
@@ -53,3 +55,23 @@ the profile's core supports the tested ordinary-state behavior. `equal_to`
 compares a profile's final RAM/RGB with an earlier profile; `counter_delta`
 checks an expected guest-frame difference. An optional `--system` supplies
 read-only firmware without putting firmware in the test repository.
+
+## Pinned test dependency
+
+A core keeps `fetch_harness.py` and `harness.lock.json` in its test directory.
+The lock names a full RetroArch commit and SHA-256 for each needed file,
+including `libretro-common/include/libretro.h`. Only explicit test targets
+fetch sources. Normal core builds and gameplay have no network dependency.
+
+`fetch_harness.py --path` prints the cache path without fetching. A normal
+invocation checks the cache and fetches missing files; `--offline` requires
+a complete cache. `--cache DIRECTORY` selects another cache. Checksums are
+checked before use, and interrupted or mismatched downloads are not published.
+Cores expose `TOOLS` to use this directory from a local RetroArch checkout,
+bypassing the pin and all downloads for development or offline tests.
+
+The small fetch helper is copied into core test directories; the host, proxy,
+profile runners and their checks remain here. When updating the helper, run
+`python3 test_fetch_harness.py`. Update a core's lock only after publishing the
+chosen revision and calculating checksums from its Git blobs (not a working
+tree with converted line endings). Do not follow a branch head or tag.
