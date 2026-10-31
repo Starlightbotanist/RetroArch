@@ -1015,6 +1015,27 @@ def shell_command(shell, script, plat):
    return None
 
 
+def host_shell_command(cmd, cwd, env):
+   path = os.pathsep.join(os.path.join(cwd, p)
+                         for p in env.get('PATH', os.defpath).split(os.pathsep))
+   name = os.path.join(cwd, cmd[0]) if os.path.dirname(cmd[0]) else cmd[0]
+   program = shutil.which(name, path=path)
+   if not program:
+      raise OSError('shell "%s" is not on the step PATH' % cmd[0])
+   program = os.path.abspath(program)
+   if sys.platform.startswith('win'):
+      system = os.environ.get('SystemRoot', r'C:\Windows')
+      launchers = [os.path.join(system, d, 'bash.exe')
+                   for d in ('System32', 'Sysnative', 'SysWOW64')]
+      local = os.environ.get('LOCALAPPDATA')
+      if local:
+         launchers.append(os.path.join(local, 'Microsoft', 'WindowsApps', 'bash.exe'))
+      if os.path.normcase(program) in [os.path.normcase(p) for p in launchers]:
+         raise OSError('add native Bash to the step PATH; the WSL launcher is not supported')
+   # Windows process lookup can prefer a system launcher over the step PATH.
+   return [program] + cmd[1:]
+
+
 # --------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------
@@ -1294,7 +1315,12 @@ class Runner:
             self.say('   working directory %s does not exist' % wd)
             proc = None
          else:
-            proc = subprocess.run(cmd, cwd=cwd, env=run_env)
+            try:
+               cmd = host_shell_command(cmd, cwd, run_env)
+               proc = subprocess.run(cmd, cwd=cwd, env=run_env)
+            except OSError as e:
+               self.say('   ' + str(e))
+               proc = None
       ok = proc is not None and proc.returncode == 0
       self.absorb(files, ctx, record, extra_path)
       record['outcome'] = 'success' if ok else 'failure'
@@ -1742,7 +1768,7 @@ jobs:
 def _run_fixture():
    """Runs FIXTURE on this machine: environment, path and output files,
    matrix include, needs, continue-on-error and bash's pipefail."""
-   ws = tempfile.mkdtemp(prefix='ci_local.fixture.')
+   ws = tempfile.mkdtemp(prefix='ci_local.fixture space.')
    try:
       path = os.path.join(ws, 'fixture.yml')
       with open(path, 'w', encoding='utf-8') as f:
@@ -1775,6 +1801,90 @@ def _run_fixture():
       return len(problems)
    finally:
       shutil.rmtree(ws, ignore_errors=True)
+
+
+def _shell_fixture():
+   from unittest import mock
+   class Opts:
+      dry_run = False
+      skip = []
+   failures = 0
+   with tempfile.TemporaryDirectory(prefix='ci_local.shell space.') as ws:
+      wf = type('Workflow', (), {'name': 'shell fixture', 'inputs': lambda self: {}})()
+      ctx = base_context(wf, 'test', ws, ws)
+      ctx['env'] = {'PATH': 'step-bin'}
+      files = {name: os.path.join(ws, name)
+               for name in ('env', 'path', 'output', 'step_summary')}
+      runner = Runner(Opts())
+      runner.say = lambda msg: None
+      program = os.path.join(ws, 'native shell.exe')
+      extra = [os.path.join(ws, 'extra bin')]
+      step = {'id': 'test', 'shell': 'bash', 'run': 'echo test'}
+
+      def launched(cmd, **kw):
+         nonlocal failures
+         failures += cmd[0] != program or kw['cwd'] != ws
+         failures += not os.path.isfile(cmd[-1])
+         with open(cmd[-1], encoding='utf-8') as f:
+            failures += f.read() != step['run']
+         failures += kw['env']['PATH'] != os.pathsep.join(extra + ['step-bin'])
+         with open(kw['env']['GITHUB_OUTPUT'], 'w') as f:
+            f.write('word=from-shell\n')
+         return subprocess.CompletedProcess(cmd, 0)
+
+      with mock.patch.object(shutil, 'which', return_value=program) as which, \
+            mock.patch.object(subprocess, 'run', side_effect=launched):
+         status = runner.run_step(wf, {}, step, 0, ctx, 'success', 'Linux',
+                                  {}, ws, ws, files, extra, None, None)
+         expected_path = os.pathsep.join(os.path.join(ws, p)
+                                        for p in extra + ['step-bin'])
+         failures += which.call_args[1]['path'] != expected_path
+         failures += status != 'success'
+         failures += ctx['steps']['test']['outputs'] != {'word': 'from-shell'}
+
+      for available, error, continuing in [(False, None, False),
+                                            (False, None, True),
+                                            (True, OSError('not executable'), False)]:
+         step['continue-on-error'] = continuing
+         with mock.patch.object(shutil, 'which', return_value=program if available else None), \
+               mock.patch.object(subprocess, 'run', side_effect=error) as run:
+            status = runner.run_step(wf, {}, step, 0, ctx, 'success', 'Linux',
+                                     {}, ws, ws, files, [], None, None)
+            failures += run.call_count != (1 if available else 0)
+            failures += status != ('success' if continuing else 'failure')
+            failures += ctx['steps']['test']['outcome'] != 'failure'
+            failures += bool(ctx['steps']['test']['outputs'])
+
+      with mock.patch.object(shutil, 'which', return_value=program) as which:
+         command = ['./local-shell', 'script with spaces']
+         failures += host_shell_command(command, ws, {}) != [program, command[1]]
+         failures += which.call_args[0][0] != os.path.join(ws, command[0])
+
+      with mock.patch.object(shutil, 'which', return_value='container-engine'), \
+            mock.patch.object(subprocess, 'run', return_value=
+                  subprocess.CompletedProcess([], 0)) as run, \
+            mock.patch(__name__ + '.host_shell_command', side_effect=AssertionError('host lookup')):
+         runner.run_step(wf, {}, step, 0, ctx, 'success', 'Linux',
+                         {}, ws, ws, files, [], 'container-engine', 'container-id')
+         command = run.call_args[0][0]
+         failures += command[command.index('container-id') + 1] != 'bash'
+
+      if sys.platform.startswith('win'):
+         system = os.environ.get('SystemRoot', r'C:\Windows')
+         launchers = [os.path.join(system, d, 'bash.exe')
+                      for d in ('System32', 'Sysnative', 'SysWOW64')]
+         if os.environ.get('LOCALAPPDATA'):
+            launchers.append(os.path.join(os.environ['LOCALAPPDATA'],
+                                          'Microsoft', 'WindowsApps', 'bash.exe'))
+         for launcher in launchers:
+            with mock.patch.object(shutil, 'which', return_value=launcher.upper()), \
+                  mock.patch.object(subprocess, 'run') as run:
+               status = runner.run_step(wf, {}, step, 0, ctx, 'success', 'Linux',
+                                        {}, ws, ws, files, [], None, None)
+               failures += status != 'failure' or run.call_count != 0
+   if failures:
+      print('FAIL shell fixture: %d checks' % failures)
+   return failures
 
 
 def _emsdk_fixture():
@@ -1836,7 +1946,7 @@ def _emsdk_fixture():
 
 
 def cmd_selftest():
-   bad = _emsdk_fixture()
+   bad = _emsdk_fixture() + _shell_fixture()
    try:
       import yaml
    except ImportError:
