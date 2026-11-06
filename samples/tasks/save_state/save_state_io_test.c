@@ -1674,6 +1674,36 @@ static void test_task_failure_recovery(bool threaded)
    filestream_delete(path);
 }
 
+static void test_ram_flush_retry(bool threaded)
+{
+   const char *path = "sst_ram_flush.state";
+   frontend_reset();
+   core_fill(3 * TEST_SAVE_STATE_CHUNK);
+   memset(core_mem, 0x11, core_len);
+   filestream_delete(path);
+   okf(content_save_state(path, true), "RAM: an existing disk save is created");
+   drain_states(threaded);
+   memset(core_mem, 0x22, core_len);
+   okf(content_save_state_to_ram() && content_ram_state_pending(),
+         "RAM: a new snapshot is pending in memory");
+   okf(!content_ram_state_to_file("sst_absent_review_directory/state")
+         && content_ram_state_pending(),
+         "RAM: a failed flush preserves the pending snapshot");
+   memset(core_mem, 0x33, core_len);
+   content_load_state(path, false, false);
+   drain_states(threaded);
+   okf(core_mem[0] == 0x11 && core_mem[core_len - 1] == 0x11,
+         "RAM: the earlier disk save still reaches the consumer");
+   stub_settings.bools.save_file_compression = true;
+   okf(content_ram_state_to_file(path) && !content_ram_state_pending(),
+         "RAM: retry commits the pending snapshot");
+   content_load_state(path, false, false);
+   drain_states(threaded);
+   okf(core_mem[0] == 0x22 && core_mem[core_len - 1] == 0x22,
+         "RAM: the actual consumer receives the retried snapshot");
+   filestream_delete(path);
+}
+
 #ifdef HAVE_COMPRESSION
 /* -----------------------------------------------------------------
  * 13. Undo puts back the file a save replaced, as it was.
@@ -1766,6 +1796,7 @@ static int run_default_lane(void)
    test_queued_conversion_failure();
    test_close_with_pending_load(false);
    test_task_failure_recovery(false);
+   test_ram_flush_retry(false);
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif
@@ -1788,6 +1819,7 @@ static int run_threaded_lane(void)
    test_overwrite_keeps_slot(true);
    test_close_with_pending_load(true);
    test_task_failure_recovery(true);
+   test_ram_flush_retry(true);
 
    content_reset_savestate_backups();
    task_queue_deinit();
