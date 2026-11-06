@@ -66,4 +66,4 @@ jobs:
         working-directory: samples/runloop/auto_state_load
         run: |
           make clean
-          make CC=x86_64-w64-mingw32-gcc TARGET=auto_state_load_test.exe RUNTIME_TARGET=runtime_state_slot_test.exe EXTRA_CFLAGS='-DHAVE_NETWORKING -DHAVE_CHEEVOS'
+          make CC=x86_64-w64-mingw32-gcc TARGET=auto_state_load_test.exe RUNTIME_TARGET=runtime_state_slot_test.exe SCAN_TARGET=rolling_state_scan_test.exe EXTRA_CFLAGS='-DHAVE_NETWORKING -DHAVE_CHEEVOS'
