@@ -23,6 +23,7 @@ static void *save_userdata;
 static char saved_path[256];
 static char loaded_path[256];
 static bool accept_save = true;
+static bool accept_ram_save = true;
 static const char *delete_failure;
 static const char *pending_path;
 static unsigned rolling_failures;
@@ -163,7 +164,7 @@ bool content_save_state(const char *path, bool disk)
 {
    return content_save_state_notify(path, disk, NULL, NULL);
 }
-bool content_save_state_to_ram(void) { return true; }
+bool content_save_state_to_ram(void) { return accept_ram_save; }
 bool content_state_file_in_use(const char *path)
 {
    return pending_path && !strcmp(pending_path, path);
@@ -236,6 +237,7 @@ static void rolling_reset(void)
    save_userdata = NULL;
    saved_path[0] = loaded_path[0] = '\0';
    accept_save = true;
+   accept_ram_save = true;
    delete_failure = NULL;
    runtime_present = true;
    runtime_slot = 9;
@@ -384,6 +386,13 @@ static void test_rolling_states(void)
    CHECK_ROLLING(test_settings.ints.state_slot == 9);
    CHECK_ROLLING(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
    CHECK_ROLLING(has_file("test.state") && file_count == 10);
+   accept_ram_save = false;
+   CHECK_ROLLING(!command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
+   CHECK_ROLLING(test_settings.ints.state_slot == 9);
+   CHECK_ROLLING(has_file("test.state") && file_count == 10);
+   accept_ram_save = true;
+   CHECK_ROLLING(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
+   CHECK_ROLLING(test_settings.ints.state_slot == 9 && file_count == 10);
    accept_save = false;
    CHECK_ROLLING(!command_event_main_state(CMD_EVENT_SAVE_STATE));
    CHECK_ROLLING(has_file("test.state") && file_count == 10);

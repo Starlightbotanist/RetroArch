@@ -1485,15 +1485,26 @@ static void test_pruned_queued_backup(void)
 {
    unsigned explicit_load;
    const char *preceding = "sst_preceding.state";
+   const char *older = "sst_older_backup.state";
    struct prune_fixture fixture = {"sst_queued.state", false};
    for (explicit_load = 0; explicit_load < 2; explicit_load++)
    {
       frontend_reset();
+      content_reset_savestate_backups();
       core_fill(3 * TEST_SAVE_STATE_CHUNK);
       fixture.explicit_load = explicit_load != 0;
       filestream_delete(preceding);
       filestream_delete(fixture.path);
+      filestream_delete(older);
+      memset(core_mem, 0x11, core_len);
       content_save_state(fixture.path, true);
+      pump(1000);
+      /* A skipped backup leaves this earlier undo entry intact. */
+      memset(core_mem, 0x22, core_len);
+      content_save_state(older, true);
+      pump(1000);
+      memset(core_mem, 0x33, core_len);
+      content_save_state(older, true);
       pump(1000);
       content_save_state_notify(preceding, true, prune_queued_backup_cb, &fixture);
       memset(core_mem, 0x66, core_len);
@@ -1511,9 +1522,24 @@ static void test_pruned_queued_backup(void)
       pump(1000);
       okf(core_mem[0] == 0x66 && core_mem[core_len - 1] == 0x66,
             "queued: the actual consumer receives the queued save");
+      okf(content_undo_save_state(), "queued: the previous backup remains undoable");
+      pump(1000);
+      memset(core_mem, 0x88, core_len);
+      content_load_state(fixture.explicit_load ? fixture.path : older, false, false);
+      pump(1000);
+      okf(core_mem[0] == (fixture.explicit_load ? 0x11 : 0x22)
+            && core_mem[core_len - 1] == core_mem[0],
+            "queued: undo restores the pinned backup or the older retained backup");
+      memset(core_mem, 0x88, core_len);
+      content_load_state(fixture.explicit_load ? older : fixture.path, false, false);
+      pump(1000);
+      okf(core_mem[0] == (fixture.explicit_load ? 0x33 : 0x66)
+            && core_mem[core_len - 1] == core_mem[0],
+            "queued: undo leaves the other file's completed save intact");
    }
    filestream_delete(preceding);
    filestream_delete(fixture.path);
+   filestream_delete(older);
 }
 
 struct cycle_result
