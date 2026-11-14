@@ -518,13 +518,15 @@ static size_t state_manager_raw_maxsize(size_t uncomp)
  * Returns the number of bytes actually written to 'patch'.
  */
 STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
-      const void *src, const void *dst, size_t len, void *patch, int tier)
+      const void *src, const void *dst, size_t len, void *patch, size_t patch_size, int tier)
 {
    const uint16_t  *old16 = (const uint16_t*)src;
    const uint16_t  *new16 = (const uint16_t*)dst;
    uint16_t *compressed16 = (uint16_t*)patch;
-   size_t          num16s = (len + sizeof(uint16_t) - 1)
+   size_t           words = (len + sizeof(uint16_t) - 1)
       / sizeof(uint16_t);
+   size_t          num16s = words;
+   const uint16_t    *end = compressed16 + patch_size / sizeof(uint16_t) - 3;
 
    while (num16s)
    {
@@ -546,6 +548,9 @@ STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
          if (skip > UINT32_MAX)
             skip         = UINT32_MAX;
 
+         if (end - compressed16 < 3)
+            goto dense;
+
          *compressed16++ = 0;
          *compressed16++ = skip;
          *compressed16++ = skip >> 16;
@@ -555,6 +560,9 @@ STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
       changed = find_same(old16, new16, tier);
       if (changed > UINT16_MAX)
          changed = UINT16_MAX;
+
+      if ((size_t)(end - compressed16) < 2 + changed)
+         goto dense;
 
       *compressed16++ = changed;
       *compressed16++ = skip;
@@ -574,11 +582,29 @@ STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
       compressed16 += changed;
    }
 
+finish:
    compressed16[0]  = 0;
    compressed16[1]  = 0;
    compressed16[2]  = 0;
 
    return (uint8_t*)(compressed16 + 3) - (uint8_t*)patch;
+
+dense:
+   /* A run split can cost more than its skipped words save.
+    * Dense runs of at most UINT16_MAX words fit the reserved bound. */
+   old16        = (const uint16_t*)src;
+   compressed16 = (uint16_t*)patch;
+   while (words)
+   {
+      size_t count    = words > UINT16_MAX ? UINT16_MAX : words;
+      *compressed16++ = count;
+      *compressed16++ = 0;
+      memcpy(compressed16, old16, count * sizeof(uint16_t));
+      compressed16   += count;
+      old16          += count;
+      words          -= count;
+   }
+   goto finish;
 }
 
 #ifdef STATE_MANAGER_HAVE_AVX2_SCAN
@@ -586,38 +612,38 @@ STATE_MANAGER_SCAN_INLINE size_t state_manager_raw_compress_tier(
  * always_inline cannot reach them through the baseline copy. */
 __attribute__((target("avx2"), flatten))
 static size_t state_manager_raw_compress_avx2(const void *src,
-      const void *dst, size_t len, void *patch)
+      const void *dst, size_t len, void *patch, size_t patch_size)
 {
-   return state_manager_raw_compress_tier(src, dst, len, patch, 1);
+   return state_manager_raw_compress_tier(src, dst, len, patch, patch_size, 1);
 }
 #endif
 
 #ifdef STATE_MANAGER_HAVE_AVX512_SCAN
 __attribute__((target("avx512f,avx512bw"), flatten))
 static size_t state_manager_raw_compress_avx512(const void *src,
-      const void *dst, size_t len, void *patch)
+      const void *dst, size_t len, void *patch, size_t patch_size)
 {
-   return state_manager_raw_compress_tier(src, dst, len, patch, 2);
+   return state_manager_raw_compress_tier(src, dst, len, patch, patch_size, 2);
 }
 #endif
 
 static size_t state_manager_raw_compress(const void *src,
-      const void *dst, size_t len, void *patch)
+      const void *dst, size_t len, void *patch, size_t patch_size)
 {
 #ifdef STATE_MANAGER_HAVE_AVX2_SCAN
    switch (state_manager_scan_tier())
    {
 #ifdef STATE_MANAGER_HAVE_AVX512_SCAN
       case 2:
-         return state_manager_raw_compress_avx512(src, dst, len, patch);
+         return state_manager_raw_compress_avx512(src, dst, len, patch, patch_size);
 #endif
       case 1:
-         return state_manager_raw_compress_avx2(src, dst, len, patch);
+         return state_manager_raw_compress_avx2(src, dst, len, patch, patch_size);
       default:
          break;
    }
 #endif
-   return state_manager_raw_compress_tier(src, dst, len, patch, 0);
+   return state_manager_raw_compress_tier(src, dst, len, patch, patch_size, 0);
 }
 
 /*
@@ -803,6 +829,9 @@ static state_manager_t *state_manager_new(
             &max_comp_size))
       goto error;
 
+   if (buffer_size < sizeof(size_t))
+      goto error;
+
    state_data         = (uint8_t*)malloc(buffer_size);
 
    if (!state_data)
@@ -871,7 +900,7 @@ error:
 
 static bool state_manager_pop(state_manager_t *state, const void **data)
 {
-   size_t start;
+   size_t start, end;
    uint8_t *out                 = NULL;
    const uint8_t *compressed    = NULL;
 
@@ -889,22 +918,20 @@ static bool state_manager_pop(state_manager_t *state, const void **data)
    if (state->head == state->tail)
       return false;
 
-   start                        = read_size_t(state->head - sizeof(size_t));
-   /* start comes out of the buffer itself, so it is checked by
-    * subtracting from the capacity rather than adding to it: the
-    * addition wraps on a corrupt value and lets the bound pass. */
-   if (     state->capacity < sizeof(size_t)
-         || start > state->capacity - sizeof(size_t))
+   end   = state->head - state->data - sizeof(size_t);
+   start = read_size_t(state->data + end);
+   /* If the head wrapped, its backward link is at offset zero.
+    * The compressed record remains in the contiguous span at the end. */
+   if (!end)
+      end = state->capacity;
+   if (start < sizeof(size_t) || start > end ||
+         end - start < sizeof(size_t))
       return false;
+
    compressed                   = state->data + start + sizeof(size_t);
    out                          = state->thisblock;
-
-   /* The record runs from its start to the size_t that pointed here;
-    * a record that does not decode inside that, or inside the block,
-    * is the end of the ring's usable history. */
    if (!state_manager_raw_decompress(compressed,
-            (size_t)(state->head - sizeof(size_t) - compressed), out,
-            state->blocksize))
+            end - start - sizeof(size_t), out, state->blocksize))
       return false;
 
    state->head                  = state->data + start;
@@ -946,42 +973,52 @@ static void state_manager_push_do(state_manager_t *state)
    {
       uint8_t *compressed;
       const uint8_t *oldb, *newb;
-      size_t headpos, tailpos, remaining;
-      if (state->capacity < sizeof(size_t) + state->maxcompsize)
+      uint8_t *front = state->data + sizeof(size_t);
+      size_t headpos = state->head - state->data;
+
+      if (state->capacity < sizeof(size_t) ||
+            state->maxcompsize > state->capacity - sizeof(size_t))
       {
          RARCH_ERR("[Rewind] %s.\n",
                msg_hash_to_str(MSG_REWIND_BUFFER_CAPACITY_INSUFFICIENT));
          return;
       }
 
-recheckcapacity:;
-      headpos   = state->head - state->data;
-      tailpos   = state->tail - state->data;
-      remaining = (tailpos + state->capacity -
-            sizeof(size_t) - headpos - 1) % state->capacity + 1;
-
-      if (remaining <= state->maxcompsize)
+      while (state->tail != state->head)
       {
+         size_t tailpos = state->tail - state->data;
+         size_t distance = tailpos > headpos
+            ? tailpos - headpos : state->capacity - headpos + tailpos;
+
+         if (distance > sizeof(size_t) &&
+               distance - sizeof(size_t) > state->maxcompsize)
+            break;
+
          state->tail = state->data + read_size_t(state->tail);
          state->entries--;
-         goto recheckcapacity;
       }
+
+      /* A record starting at the front cannot wrap its own end there.
+       * If it left too little room for this write, eviction has already
+       * emptied the ring. Restart both cursors at the front. */
+      if (state->maxcompsize > state->capacity - headpos)
+         state->head = state->tail = front;
 
       oldb              = state->thisblock;
       newb              = state->nextblock;
       compressed        = state->head + sizeof(size_t);
 
       compressed       += state_manager_raw_compress(oldb, newb,
-            state->blocksize, compressed);
+            state->blocksize, compressed, state->maxcompsize - 2 * sizeof(size_t));
 
-      /* The next record must fit before the end of the ring without
-       * folding mid-record; if it will not, the head folds to the
-       * start now, and the record that starts there is dropped, as a
-       * record dropped for room anywhere else is. */
-      if (compressed - state->data + state->maxcompsize > state->capacity)
+      /* Reserve space for the next record while leaving the backward
+       * link in the last sizeof(size_t) bytes before the new head. */
+      if (state->head != front &&
+            state->maxcompsize > state->capacity -
+               (size_t)(compressed - state->data) - sizeof(size_t))
       {
          compressed     = state->data;
-         if (state->tail == state->data + sizeof(size_t))
+         if (state->tail == front)
          {
             state->tail = state->data + read_size_t(state->tail);
             state->entries--;

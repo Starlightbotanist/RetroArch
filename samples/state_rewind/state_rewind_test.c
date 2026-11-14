@@ -94,7 +94,7 @@ static bool roundtrip(const uint8_t *oldb, const uint8_t *newb, size_t block_siz
    size_t plen;
    bool ok;
    memcpy(work, newb, block_size);
-   plen = state_manager_raw_compress(oldb, newb, block_size, patch);
+   plen = state_manager_raw_compress(oldb, newb, block_size, patch, maxp);
    CHECK(plen <= maxp, "patch of %u bytes exceeds the maximum %u", (unsigned)plen, (unsigned)maxp);
    ok = state_manager_raw_decompress(patch, plen, work, block_size);
    CHECK(ok, "a valid patch was refused");
@@ -251,7 +251,7 @@ static void t_scan_tiers_identical(void)
       {
          size_t len;
          state_manager_scan_cached = tier;
-         len = state_manager_raw_compress(a, b, bs, tier ? pt : p0);
+         len = state_manager_raw_compress(a, b, bs, tier ? pt : p0, state_manager_raw_maxsize(bs));
          if (!tier)
             len0 = len;
          else if (len != len0 || memcmp(p0, pt, len))
@@ -442,7 +442,7 @@ static void t_decompress_atomic(void)
    for (i = 0; i < bs; i++) a[i] = (uint8_t)(i * 3);
    memcpy(b, a, bs);
    for (i = 0; i < bs / 2; i += 97) ((uint16_t*)b)[i] ^= 0x0F0F;   /* several dirty runs */
-   plen = state_manager_raw_compress(a, b, bs, patch);
+   plen = state_manager_raw_compress(a, b, bs, patch, state_manager_raw_maxsize(bs));
    /* Forge the skip of the last run so it points past the block. */
    p16 = (uint16_t*)patch;
    {
@@ -460,7 +460,7 @@ static void t_decompress_atomic(void)
    CHECK(memcmp(work, b, bs) == 0, "a refused patch was partly applied");
    /* Truncated: the record ends before its terminator. */
    memcpy(work, b, bs);
-   plen = state_manager_raw_compress(a, b, bs, patch);
+   plen = state_manager_raw_compress(a, b, bs, patch, state_manager_raw_maxsize(bs));
    CHECK(!state_manager_raw_decompress(patch, plen - 6, work, bs), "a record without its terminator was accepted");
    CHECK(memcmp(work, b, bs) == 0, "a truncated record was partly applied");
    /* Seeded mutations: never a crash, never a write outside, and a
@@ -470,7 +470,7 @@ static void t_decompress_atomic(void)
       for (it = 0; it < 300; it++)
       {
          size_t pos;
-         plen = state_manager_raw_compress(a, b, bs, patch);
+         plen = state_manager_raw_compress(a, b, bs, patch, state_manager_raw_maxsize(bs));
          pos  = rnd() % plen;
          patch[pos] ^= (uint8_t)(rnd() | 1);
          memcpy(work, b, bs);
@@ -544,6 +544,94 @@ static void t_pathological_state_size(void)
    }
 }
 
+
+/* Check the actual fixed core size, before the frontend adds its envelope. */
+static void t_s2_small_ring(void)
+{
+   const size_t size = 20316160;
+   const size_t capacity = 20 * 1024 * 1024;
+   uint8_t *expected = (uint8_t*)malloc(size);
+   unsigned mode;
+   if (!expected)
+   {
+      CHECK(false, "could not allocate small-ring fixture");
+      return;
+   }
+   for (mode = 0; mode < 2; mode++)
+   {
+      state_manager_t *sm = state_manager_new(size, capacity);
+      unsigned i, evictions = 0, wraps = 0, restored = 0;
+      bool valid = sm != NULL;
+      if (!sm)
+      {
+         CHECK(false, "could not allocate small-ring manager");
+         break;
+      }
+      memset(sm->data, 0x55, capacity);
+      for (i = 0; i < 64; i++)
+      {
+         void *where;
+         size_t at, head, count, before, previous;
+         state_manager_push_where(sm, &where);
+         before = sm->entries;
+         previous = (size_t)(sm->head - sm->data);
+         memset(where, 0, size);
+         memset(where, i + 1, !mode ? size :
+               (i % 7 ? size / 64 : size - size / 4));
+         state_manager_push_do(sm);
+
+         head = (uintptr_t)sm->head - (uintptr_t)sm->data;
+         at = (uintptr_t)sm->tail - (uintptr_t)sm->data;
+         valid = head >= sizeof(size_t) && head <= capacity &&
+               at >= sizeof(size_t) && at <= capacity;
+         for (count = 1; valid && at != head; count++)
+         {
+            size_t next;
+            if (count >= sm->entries || at > capacity - sizeof(size_t))
+            {
+               valid = false;
+               break;
+            }
+            next = read_size_t(sm->data + at);
+            valid = next >= sizeof(size_t) && next <= capacity &&
+                  read_size_t(sm->data + next - sizeof(size_t)) == at;
+            at = next;
+         }
+         valid = valid && count == sm->entries;
+         if (!valid)
+         {
+            CHECK(false, "small-ring mode %u insertion %u invalid: head=%zu tail=%zu entries=%u",
+                  mode, i + 1, head,
+                  (size_t)((uintptr_t)sm->tail - (uintptr_t)sm->data), sm->entries);
+            break;
+         }
+         if (head < previous)
+            wraps++;
+         evictions += (unsigned)(before + 1 - sm->entries);
+      }
+      if (valid)
+      {
+         unsigned saved = sm->entries;
+         const void *data;
+         while (state_manager_pop(sm, &data))
+         {
+            --i;
+            memset(expected, 0, size);
+            memset(expected, i + 1, !mode ? size :
+                  (i % 7 ? size / 64 : size - size / 4));
+            CHECK(!memcmp(expected, data, size), "restored wrong snapshot %u", i);
+            restored++;
+         }
+         CHECK(sm->entries == 0 && restored == saved, "small-ring history lost");
+         CHECK(evictions && (!mode || wraps), "small-ring transition not exercised");
+      }
+      printf("   s2_small_ring: state=%zu capacity=%zu mode=%u inserted=%u evicted=%u wrapped=%u restored=%u\n",
+            size, capacity, mode, i + restored, evictions, wraps, restored);
+      manager_free(sm);
+   }
+   free(expected);
+}
+
 int main(void)
 {
    printf("state_rewind:\n");
@@ -557,6 +645,7 @@ int main(void)
    t_push_pop_n();
    t_wrap_near_end();
    t_drop_oldest();
+   t_s2_small_ring();
    t_init_oom_guard();
    t_pathological_state_size();
    t_decompress_oob();
